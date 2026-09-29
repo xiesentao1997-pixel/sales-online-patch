@@ -1,0 +1,2159 @@
+--- a/electron/api-client.mjs
++++ b/electron/api-client.mjs
+@@ -1,17 +1,32 @@
+-import { app, safeStorage } from 'electron';
+-import fs from 'node:fs/promises';
+-import path from 'node:path';
++import { app, safeStorage } from "electron";
++import fs from "node:fs/promises";
++import { readFileSync } from "node:fs";
++import path from "node:path";
+ 
+-const PRODUCTION_BASE_URL = 'https://sales-api.hqyk.pro';
++export const DEV_BASE_URL = "http://127.0.0.1:3200";
++export const PRODUCTION_BASE_URL = "https://sales-api.hqyk.pro";
++
++function readSavedBaseUrl() {
++  try {
++    const file = path.join(app.getPath("userData"), "api-base-url.txt");
++    const raw = readFileSync(file, "utf8").trim();
++    return raw || "";
++  } catch {
++    return "";
++  }
++}
+ 
+ export function apiBaseUrl() {
+-  const override = process.env.SALES_API_BASE_URL;
+-  if (override && override.trim()) return override.trim().replace(/\/+$/, '');
+-  return PRODUCTION_BASE_URL;
++  const override = (process.env.SALES_API_BASE_URL || "").trim() || readSavedBaseUrl();
++  const chosen = (override || DEV_BASE_URL).replace(/\/+$/, "");
++  if (/106\.53\.96\.62/.test(chosen) || chosen.startsWith("postgres") || /:5432(\/|$)/.test(chosen)) {
++    throw new Error("不能把数据库或服务器公网地址当作接口地址");
++  }
++  return chosen;
+ }
+ 
+ function sessionFile() {
+-  return path.join(app.getPath('userData'), 'online-session.bin');
++  return path.join(app.getPath("userData"), "online-session.bin");
+ }
+ 
+ let memoryToken = null;
+@@ -35,7 +50,7 @@
+ export async function saveToken(token) {
+   memoryToken = token || null;
+   if (!token) {
+-    await fs.rm(sessionFile(), { force: true });
++    await fs.rm(sessionFile(), { force: true }).catch(() => undefined);
+     return;
+   }
+   if (!safeStorage.isEncryptionAvailable()) {
+@@ -48,39 +63,47 @@
+ 
+ export async function clearToken() {
+   memoryToken = null;
+-  await fs.rm(sessionFile(), { force: true });
++  await fs.rm(sessionFile(), { force: true }).catch(() => undefined);
+ }
+ 
+ export class ApiError extends Error {
+   constructor(kind, message, status) {
+     super(message);
+-    this.name = 'ApiError';
++    this.name = "ApiError";
+     this.kind = kind;
+     this.status = status;
+   }
+ }
+ 
+-function friendlyError(status) {
+-  if (status === 401) return new ApiError('unauthorized', '登录已过期，请重新登录。', status);
+-  if (status === 403) return new ApiError('forbidden', '该操作没有权限。', status);
+-  if (status === 404) return new ApiError('not_found', '记录不存在或已被删除。', status);
+-  if (status === 409) return new ApiError('conflict', '数据已被更新，请重新打开后修改。', status);
+-  if (status === 413) return new ApiError('too_large', '文件过大，无法上传。', status);
+-  if (status === 422 || status === 400) return new ApiError('invalid', '提交的数据不合法，请检查后重试。', status);
+-  return new ApiError('server', '服务器暂时无法处理请求，请稍后重试。', status);
++function friendlyError(status, data) {
++  const code = data && typeof data.error === "string" ? data.error : "";
++  if (status === 401 && code === "invalid_credentials") return new ApiError("unauthorized", "用户名或密码不正确", status);
++  if (code === "account_disabled") return new ApiError("forbidden", "账号已停用", status);
++  if (code === "current_password_mismatch") return new ApiError("forbidden", "当前密码不正确", status);
++  if (code === "username_exists") return new ApiError("conflict", "用户名已存在", status);
++  if (status === 401 || code === "unauthenticated") return new ApiError("unauthorized", "登录已失效，请重新登录", status);
++  if (status === 403 || code === "forbidden" || code === "role_not_allowed") return new ApiError("forbidden", "当前账号没有此操作权限", status);
++  if (status === 404 || code === "not_found" || code === "file_missing") return new ApiError("not_found", "数据不存在或已被删除", status);
++  if (status === 413 || code === "file_too_large") return new ApiError("too_large", "图片超过25MB", status);
++  if (code === "invalid_item_input" || code === "items_required" || code === "invalid_record_type" || code === "invalid_attachment_type" || code === "invalid_file_type" || code === "invalid_order") {
++    return new ApiError("invalid", "订单数据不完整，请检查后再提交", status);
++  }
++  if (code === "invalid_request" || status === 400) return new ApiError("invalid", "提交的内容有误，请检查后再试", status);
++  if (status === 0) return new ApiError("network", "无法连接服务器，请检查网络连接", status);
++  return new ApiError("server", "服务器暂时无法处理，请稍后重试", status);
+ }
+ 
+ async function request(method, route, options = {}) {
+   const { body, auth = true, timeoutMs = 20000 } = options;
+-  const headers = { accept: 'application/json' };
++  const headers = { accept: "application/json" };
+   let payload;
+   if (body !== undefined) {
+-    headers['content-type'] = 'application/json';
++    headers["content-type"] = "application/json";
+     payload = JSON.stringify(body);
+   }
+   if (auth) {
+     const token = await loadToken();
+-    if (token) headers.authorization = 'Bearer ' + token;
++    if (token) headers.authorization = "Bearer " + token;
+   }
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), timeoutMs);
+@@ -89,8 +112,8 @@
+     res = await fetch(apiBaseUrl() + route, { method, headers, body: payload, signal: controller.signal });
+   } catch (err) {
+     clearTimeout(timer);
+-    if (err && err.name === 'AbortError') throw new ApiError('timeout', '请求超时，请检查网络后重试。', 0);
+-    throw new ApiError('network', '当前无法连接服务器，请检查网络后重试。', 0);
++    if (err && err.name === "AbortError") throw new ApiError("timeout", "无法连接服务器，请检查网络连接", 0);
++    throw new ApiError("network", "无法连接服务器，请检查网络连接", 0);
+   }
+   clearTimeout(timer);
+   let data = null;
+@@ -102,156 +125,166 @@
+       data = null;
+     }
+   }
+-  if (!res.ok) throw friendlyError(res.status);
++  if (!res.ok) {
++    if (res.status === 401 && auth) await clearToken();
++    throw friendlyError(res.status, data);
++  }
+   return data;
+ }
+ 
++export async function health() {
++  return request("GET", "/health", { auth: false, timeoutMs: 4000 });
++}
++
+ export async function login(username, password) {
+-  const data = await request('POST', '/api/v1/auth/login', { body: { username, password }, auth: false });
++  const data = await request("POST", "/api/v1/auth/login", { body: { username, password }, auth: false });
+   if (data && data.token) await saveToken(data.token);
+   return data;
+ }
+ 
+ export async function logout() {
+   try {
+-    await request('POST', '/api/v1/auth/logout', {});
++    await request("POST", "/api/v1/auth/logout", {});
+   } catch {
+-    // ignore network error, logout relies on local cleanup
++    // local session is cleared even if the server is unreachable
+   }
+   await clearToken();
+ }
+ 
+ export async function me() {
+-  return request('GET', '/api/v1/auth/me', {});
++  return request("GET", "/api/v1/auth/me", {});
+ }
+ 
+ export async function changePassword(currentPassword, newPassword) {
+-  return request('POST', '/api/v1/auth/change-password', { body: { currentPassword, newPassword } });
++  return request("POST", "/api/v1/auth/change-password", { body: { currentPassword, newPassword } });
+ }
+ 
+ export async function listAccounts() {
+-  return request('GET', '/api/v1/accounts', {});
++  return request("GET", "/api/v1/accounts/", {});
+ }
+ 
+ export async function createAccount(username, password, role) {
+-  return request('POST', '/api/v1/accounts', { body: { username, password, role } });
++  return request("POST", "/api/v1/accounts/", { body: { username, password, role } });
+ }
+ 
+ export async function disableAccount(id) {
+-  return request('POST', '/api/v1/accounts/' + id + '/disable', {});
++  return request("POST", "/api/v1/accounts/" + id + "/disable", {});
+ }
+ 
+ export async function enableAccount(id) {
+-  return request('POST', '/api/v1/accounts/' + id + '/enable', {});
++  return request("POST", "/api/v1/accounts/" + id + "/enable", {});
+ }
+ 
+ export async function assignRole(id, role) {
+-  return request('POST', '/api/v1/accounts/' + id + '/role', { body: { role } });
++  return request("POST", "/api/v1/accounts/" + id + "/role", { body: { role } });
+ }
+ 
+ export async function listOrders(query = {}) {
+   const params = new URLSearchParams();
+-  for (const [k, v] of Object.entries(query)) {
+-    if (v !== undefined && v !== null && String(v) !== '') params.set(k, String(v));
++  for (const [key, value] of Object.entries(query)) {
++    if (value !== undefined && value !== null && String(value) !== "") params.set(key, String(value));
+   }
+   const qs = params.toString();
+-  return request('GET', '/api/v1/orders' + (qs ? '?' + qs : ''), {});
++  return request("GET", "/api/v1/orders/" + (qs ? "?" + qs : ""), {});
+ }
+ 
+ export async function getOrder(id) {
+-  return request('GET', '/api/v1/orders/' + id, {});
++  return request("GET", "/api/v1/orders/" + id, {});
+ }
+ 
+ export async function createOrder(payload) {
+-  return request('POST', '/api/v1/orders', { body: payload });
++  return request("POST", "/api/v1/orders/", { body: payload });
+ }
+ 
+ export async function updateOrder(id, payload) {
+-  return request('PUT', '/api/v1/orders/' + id, { body: payload });
++  return request("PUT", "/api/v1/orders/" + id, { body: payload });
+ }
+ 
+ export async function deleteOrder(id) {
+-  return request('DELETE', '/api/v1/orders/' + id, {});
+-}
+-
+-export async function updateAccount(id, patch) {
+-  return request('PATCH', '/api/v1/accounts/' + id, { body: patch });
++  return request("DELETE", "/api/v1/orders/" + id, {});
+ }
+ 
+ export async function suggestions(kind, params = {}) {
+-  const p = new URLSearchParams();
+-  for (const [k, v] of Object.entries(params)) {
+-    if (v !== undefined && v !== null && String(v) !== '') p.set(k, String(v));
++  const search = new URLSearchParams();
++  for (const [key, value] of Object.entries(params)) {
++    if (value !== undefined && value !== null && String(value) !== "") search.set(key, String(value));
+   }
+-  const qs = p.toString();
+-  return request('GET', '/api/v1/suggestions/' + kind + (qs ? '?' + qs : ''), {});
++  const qs = search.toString();
++  return request("GET", "/api/v1/suggestions/" + kind + (qs ? "?" + qs : ""), {});
+ }
+ 
+ export async function stats(params = {}) {
+-  const p = new URLSearchParams();
+-  for (const [k, v] of Object.entries(params)) {
+-    if (v !== undefined && v !== null && String(v) !== '') p.set(k, String(v));
++  const search = new URLSearchParams();
++  for (const [key, value] of Object.entries(params)) {
++    if (value !== undefined && value !== null && String(value) !== "") search.set(key, String(value));
+   }
+-  const qs = p.toString();
+-  return request('GET', '/api/v1/suggestions/stats' + (qs ? '?' + qs : ''), {});
++  const qs = search.toString();
++  return request("GET", "/api/v1/suggestions/stats" + (qs ? "?" + qs : ""), {});
+ }
+ 
+ export async function uploadAttachment({ orderId, orderItemId, attachmentType, filePath, fileName, mimeType }) {
++  const stat = await fs.stat(filePath);
++  if (stat.size > 25 * 1024 * 1024) throw new ApiError("too_large", "图片超过25MB", 413);
+   const token = await loadToken();
+   const bytes = await fs.readFile(filePath);
+   const form = new FormData();
+-  form.set('orderId', String(orderId));
+-  if (orderItemId !== undefined && orderItemId !== null) form.set('orderItemId', String(orderItemId));
+-  form.set('attachmentType', attachmentType);
+-  form.set('file', new Blob([bytes], { type: mimeType || 'application/octet-stream' }), fileName);
+-  const headers = { accept: 'application/json' };
+-  if (token) headers.authorization = 'Bearer ' + token;
++  form.set("orderId", String(orderId));
++  form.set("orderItemId", orderItemId == null ? "" : String(orderItemId));
++  form.set("attachmentType", attachmentType);
++  form.set("file", new Blob([bytes], { type: mimeType || "application/octet-stream" }), fileName);
++  const headers = { accept: "application/json" };
++  if (token) headers.authorization = "Bearer " + token;
+   let res;
+   try {
+-    res = await fetch(apiBaseUrl() + '/api/v1/attachments/upload', { method: 'POST', headers, body: form });
++    res = await fetch(apiBaseUrl() + "/api/v1/attachments/upload", { method: "POST", headers, body: form });
+   } catch {
+-    throw new ApiError('network', '当前无法连接服务器，请检查网络后重试。', 0);
++    throw new ApiError("network", "无法连接服务器，请检查网络连接", 0);
+   }
+-  const text = await res.text();
++  const responseText = await res.text();
+   let data = null;
+-  if (text) {
++  if (responseText) {
+     try {
+-      data = JSON.parse(text);
++      data = JSON.parse(responseText);
+     } catch {
+       data = null;
+     }
+   }
+-  if (!res.ok) throw friendlyError(res.status);
++  if (!res.ok) {
++    if (res.status === 401) await clearToken();
++    throw friendlyError(res.status, data);
++  }
+   return data;
+ }
+ 
+ export async function listAttachments(orderId) {
+-  return request('GET', '/api/v1/attachments/order/' + orderId, {});
++  return request("GET", "/api/v1/attachments/order/" + orderId, {});
+ }
+ 
+ export async function readAttachmentBytes(id) {
+   const token = await loadToken();
+-  const headers = { accept: '*/*' };
+-  if (token) headers.authorization = 'Bearer ' + token;
++  const headers = { accept: "*/*" };
++  if (token) headers.authorization = "Bearer " + token;
+   let res;
+   try {
+-    res = await fetch(apiBaseUrl() + '/api/v1/attachments/' + id + '/content', { headers });
++    res = await fetch(apiBaseUrl() + "/api/v1/attachments/" + id + "/content", { headers });
+   } catch {
+-    throw new ApiError('network', '当前无法连接服务器，请检查网络后重试。', 0);
++    throw new ApiError("network", "无法连接服务器，请检查网络连接", 0);
++  }
++  if (!res.ok) {
++    if (res.status === 401) await clearToken();
++    throw friendlyError(res.status, null);
+   }
+-  if (!res.ok) throw friendlyError(res.status);
+-  const buf = Buffer.from(await res.arrayBuffer());
+-  return buf;
++  return Buffer.from(await res.arrayBuffer());
+ }
+ 
+ export async function deleteAttachment(id) {
+-  return request('DELETE', '/api/v1/attachments/' + id, {});
++  return request("DELETE", "/api/v1/attachments/" + id, {});
+ }
+ 
+ export async function deleteItemAttachments(itemId) {
+-  return request('DELETE', '/api/v1/attachments/item/' + itemId, {});
++  return request("DELETE", "/api/v1/attachments/item/" + itemId, {});
+ }
+ 
+ export async function deleteOrderAttachments(orderId) {
+-  return request('DELETE', '/api/v1/attachments/order/' + orderId + '/all', {});
++  return request("DELETE", "/api/v1/attachments/order/" + orderId + "/all", {});
+ }
+--- a/electron/main.mjs
++++ b/electron/main.mjs
+@@ -204,6 +204,10 @@
+     return online.me();
+   });
+ 
++  ipcMain.handle("online:health", async () => {
++    return online.health();
++  });
++
+   ipcMain.handle("online:auth-change-password", async (_event, currentPassword, newPassword) => {
+     return online.changePassword(String(currentPassword ?? ""), String(newPassword ?? ""));
+   });
+@@ -228,10 +232,6 @@
+     return online.assignRole(Number(id), String(role ?? ""));
+   });
+ 
+-  ipcMain.handle("online:accounts-update", async (_event, id, patch) => {
+-    return online.updateAccount(Number(id), patch ?? {});
+-  });
+-
+   ipcMain.handle("online:orders-list", async (_event, query) => {
+     return online.listOrders(query ?? {});
+   });
+@@ -268,9 +268,13 @@
+       filters: [{ name: "图片", extensions: ["jpg", "jpeg", "png", "webp"] }],
+     });
+     if (picked.canceled || picked.filePaths.length === 0) return [];
+-    if (picked.filePaths.length > 40) throw new Error("一次最多选择 40 张图片");
++    if (picked.filePaths.length > 20) throw new Error("一次最多选择 20 张图片");
+     const out = [];
+     for (const p of picked.filePaths) {
++      const ext = path.extname(p).toLowerCase();
++      if (![".jpg", ".jpeg", ".png", ".webp"].includes(ext)) throw new Error("只支持 jpg、jpeg、png、webp 图片");
++      const info = await fs.stat(p);
++      if (info.size > 25 * 1024 * 1024) throw new Error("图片超过25MB");
+       const handle = randomBytes(16).toString("hex");
+       pickedFiles.set(handle, { path: p, fileName: path.basename(p), mimeType: mimeOfFile(p) });
+       out.push({ handle, fileName: path.basename(p), mimeType: mimeOfFile(p) });
+@@ -286,18 +290,28 @@
+     const handle = String(payload?.handle ?? "");
+     const picked = pickedFiles.get(handle);
+     if (!picked) throw new Error("图片凭据无效或已过期，请重新选择图片");
+-    try {
+-      return await online.uploadAttachment({
+-        orderId: Number(payload?.orderId),
+-        orderItemId: payload?.orderItemId == null ? null : Number(payload.orderItemId),
+-        attachmentType: String(payload?.attachmentType ?? ""),
+-        filePath: picked.path,
+-        fileName: picked.fileName,
+-        mimeType: picked.mimeType,
+-      });
+-    } finally {
+-      pickedFiles.delete(handle);
+-    }
++    const uploaded = await online.uploadAttachment({
++      orderId: Number(payload?.orderId),
++      orderItemId: payload?.orderItemId == null || payload?.orderItemId === "" ? null : Number(payload.orderItemId),
++      attachmentType: String(payload?.attachmentType ?? ""),
++      filePath: picked.path,
++      fileName: picked.fileName,
++      mimeType: picked.mimeType,
++    });
++    pickedFiles.delete(handle);
++    return uploaded;
++  });
++
++  ipcMain.handle("online:attach-read-picked", async (_event, handle) => {
++    const picked = pickedFiles.get(String(handle ?? ""));
++    if (!picked) throw new Error("图片凭据无效或已过期，请重新选择图片");
++    const bytes = await fs.readFile(picked.path);
++    return Uint8Array.from(bytes);
++  });
++
++  ipcMain.handle("online:attach-forget", async (_event, handle) => {
++    pickedFiles.delete(String(handle ?? ""));
++    return { ok: true };
+   });
+ 
+   ipcMain.handle("online:attach-read", async (_event, id) => {
+--- a/electron/preload-online.cjs
++++ b/electron/preload-online.cjs
+@@ -13,6 +13,9 @@
+   me() {
+     return ipcRenderer.invoke("online:auth-me");
+   },
++  health() {
++    return ipcRenderer.invoke("online:health");
++  },
+   changePassword(currentPassword, newPassword) {
+     return ipcRenderer.invoke("online:auth-change-password", String(currentPassword ?? ""), String(newPassword ?? ""));
+   },
+@@ -31,9 +34,6 @@
+   assignRole(id, role) {
+     return ipcRenderer.invoke("online:accounts-role", Number(id), String(role ?? ""));
+   },
+-  updateAccount(id, patch) {
+-    return ipcRenderer.invoke("online:accounts-update", Number(id), patch ?? {});
+-  },
+   listOrders(query) {
+     return ipcRenderer.invoke("online:orders-list", query ?? {});
+   },
+@@ -67,6 +67,12 @@
+   readAttachment(id) {
+     return ipcRenderer.invoke("online:attach-read", Number(id));
+   },
++  readPicked(handle) {
++    return ipcRenderer.invoke("online:attach-read-picked", String(handle ?? ""));
++  },
++  forgetPicked(handle) {
++    return ipcRenderer.invoke("online:attach-forget", String(handle ?? ""));
++  },
+   deleteAttachment(id) {
+     return ipcRenderer.invoke("online:attach-delete", Number(id));
+   },
+--- a/package.json
++++ b/package.json
+@@ -18,7 +18,7 @@
+     "preview:stop": "node scripts/preview.mjs stop",
+     "typecheck": "tsc --noEmit",
+     "check:auth": "node scripts/check-auth-invariant.mjs",
+-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/sales/logic.test.ts electron/db-file.test.mjs electron/attachments.test.mjs",
++    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/sales/wire.test.ts src/lib/sales/logic.test.ts electron/db-file.test.mjs electron/attachments.test.mjs",
+     "lint": "eslint .",
+     "format": "prettier --write .",
+     "desktop:renderer": "vite build --config vite.desktop.config.ts",
+--- a/scripts/online-invariants.test.mjs
++++ b/scripts/online-invariants.test.mjs
+@@ -16,7 +16,7 @@
+ // --- 订单更新 ---
+ test('api-client exposes a real order update call', () => {
+   assert.match(apiClient, /export async function updateOrder/);
+-  assert.match(apiClient, /request\('PUT', '\/api\/v1\/orders\/'/);
++  assert.match(apiClient, /request\(["']PUT["'], ["']\/api\/v1\/orders\//);
+ });
+ 
+ test('online-db updateOrder uses the update bridge, not insert', () => {
+@@ -34,15 +34,9 @@
+ });
+ 
+ // --- 账户更新 / 用户名持久化 ---
+-test('api-client exposes account update', () => {
+-  assert.match(apiClient, /export async function updateAccount/);
+-  assert.match(apiClient, /PATCH', '\/api\/v1\/accounts\/'/);
+-});
+-
+-test('updateOwnUsername persists through bridge', () => {
+-  const idx = onlineDb.indexOf('async updateOwnUsername');
+-  const block = onlineDb.slice(idx, idx + 400);
+-  assert.ok(block.includes('bridge!.updateAccount'), 'username update should call server');
++test('username changes are not sent to an undocumented endpoint', () => {
++  assert.ok(!/PATCH',\s*'\/api\/v1\/accounts\//.test(apiClient), 'contract has no username PATCH');
++  assert.match(onlineDb, /服务器不支持修改用户名/);
+ });
+ 
+ // --- 凭证安全 ---
+@@ -102,8 +96,20 @@
+ });
+ 
+ // --- 生产地址与安全 ---
+-test('production base url is the api domain', () => {
++test('production base url is the api domain and dev default is the tunnel', () => {
+   assert.match(apiClient, /https:\/\/sales-api\.hqyk\.pro/);
++  assert.match(apiClient, /http:\/\/127\.0\.0\.1:3200/);
++  assert.ok(!/return ["']http:\/\/106\.53\.96\.62/.test(apiClient), 'public ip is not the api base');
++});
++
++test('orders are encoded as human decimals and decoded from fixed point', () => {
++  const wire = read('src/lib/sales/wire.ts');
++  assert.match(wire, /encodeRequestNumber/);
++  assert.match(wire, /decodeFixedPoint/);
++  assert.match(wire, /formatQty/);
++  assert.match(onlineDb, /buildOrderBody/);
++  assert.match(onlineDb, /mapServerItem/);
++  assert.ok(!onlineDb.includes('actualSalesAmount:'), 'client must not submit calculated money');
+ });
+ 
+ test('no TLS bypass switches in client source', () => {
+--- a/src/components/sales/AccountsView.tsx
++++ b/src/components/sales/AccountsView.tsx
+@@ -3,6 +3,7 @@
+ import { toast } from "sonner";
+ import { Button, Modal, TextField } from "@/components/sales/ui";
+ import type { SalesDb } from "@/lib/sales/db";
++import { isOnlineClient } from "@/lib/sales/online-api";
+ import { ROLE_LABEL, canDeleteUser, canManageUser, creatableRoles } from "@/lib/sales/permissions";
+ import type { PublicUser, Role } from "@/lib/sales/types";
+ 
+@@ -125,7 +126,7 @@
+           refresh();
+         }}
+       />
+-      <Modal open={removing != null} title="删除账户？" description="只删除登录账户。该账户已录入的销售和退款会保留，创建人名称也不会消失。" onOpenChange={(open) => { if (!open) setRemoving(null); }}>
++      <Modal open={removing != null} title={isOnlineClient() ? "停用账户？" : "删除账户？"} description={isOnlineClient() ? "服务器会停用这个账号，并保留其已经录入的单据。停用后该账号不能再登录。" : "只删除登录账户。该账户已录入的销售和退款会保留，创建人名称也不会消失。"} onOpenChange={(open) => { if (!open) setRemoving(null); }}>
+         <div className="flex justify-end gap-2">
+           <Button variant="soft" onClick={() => setRemoving(null)}>取消</Button>
+           <Button
+--- a/src/components/sales/Attachments.tsx
++++ b/src/components/sales/Attachments.tsx
+@@ -167,7 +167,7 @@
+         <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+           <Button
+             onClick={() => {
+-              void openImage(file.relativePath).catch((error) => {
++              void openImage(file.relativePath, file.fileName).catch((error) => {
+                 toast.error(error instanceof Error ? error.message : "无法打开原图");
+               });
+             }}
+--- a/src/components/sales/SalesApp.tsx
++++ b/src/components/sales/SalesApp.tsx
+@@ -15,6 +15,7 @@
+ import { RecordForm } from "@/components/sales/RecordForm";
+ import { Button, TextField } from "@/components/sales/ui";
+ import type { SalesDb } from "@/lib/sales/db";
++import { isOnlineClient, onlineBridge } from "@/lib/sales/online-api";
+ import { ROLE_LABEL, canAccessAccounts } from "@/lib/sales/permissions";
+ import type { PublicUser, SalesOrder } from "@/lib/sales/types";
+ 
+@@ -32,6 +33,8 @@
+   const [editing, setEditing] = useState<SalesOrder | null>(null);
+   const [version, setVersion] = useState(0);
+   const [formKey, setFormKey] = useState(0);
++  const [link, setLink] = useState<"local" | "checking" | "up" | "down">(isOnlineClient() ? "checking" : "local");
++  const online = isOnlineClient();
+ 
+   useEffect(() => {
+     let live = true;
+@@ -75,6 +78,47 @@
+     };
+   }, []);
+ 
++  useEffect(() => {
++    if (!online) return;
++    let stop = false;
++    const ping = () => {
++      const bridge = onlineBridge();
++      if (!bridge) {
++        setLink("down");
++        return;
++      }
++      void bridge
++        .health()
++        .then((res) => {
++          if (!stop) setLink(res?.ok ? "up" : "down");
++        })
++        .catch(() => {
++          if (!stop) setLink("down");
++        });
++    };
++    ping();
++    const timer = window.setInterval(ping, 20000);
++    const onExpired = () => {
++      sessionStorage.removeItem(SESSION);
++      setUser(null);
++      setEditing(null);
++      setPhase("login");
++      toast.error("登录已失效，请重新登录");
++    };
++    window.addEventListener("sales-auth-expired", onExpired);
++    return () => {
++      stop = true;
++      window.clearInterval(timer);
++      window.removeEventListener("sales-auth-expired", onExpired);
++    };
++  }, [online]);
++
++  useEffect(() => {
++    const subscribe = (db as unknown as { subscribe?: (fn: () => void) => () => void } | null)?.subscribe;
++    if (!db || !subscribe) return;
++    return subscribe(() => setVersion((value) => value + 1));
++  }, [db]);
++
+   function enter(next: PublicUser) {
+     sessionStorage.setItem(SESSION, String(next.id));
+     setUser(next);
+@@ -96,11 +140,11 @@
+     }
+   }
+ 
+-  if (phase === "boot") return <Splash title="正在打开本地账本" />;
+-  if (phase === "error") return <Splash title="账本没有打开" detail={bootError} />;
+-  if (!db) return <Splash title="正在打开本地账本" />;
++  if (phase === "boot") return <Splash title={online ? "正在连接服务器" : "正在打开本地账本"} />;
++  if (phase === "error") return <Splash title={online ? "没有连上服务器" : "账本没有打开"} detail={bootError} />;
++  if (!db) return <Splash title={online ? "正在连接服务器" : "正在打开本地账本"} />;
+   if (phase === "setup") return <Setup db={db} onDone={enter} />;
+-  if (phase === "login" || !user) return <Login db={db} onDone={enter} />;
++  if (phase === "login" || !user) return <Login db={db} online={online} onDone={enter} />;
+ 
+   const items: { id: Page; label: string; icon: typeof Table2 }[] = [
+     { id: "entry", label: "记一笔", icon: ClipboardPen },
+@@ -119,7 +163,7 @@
+     <div className="min-h-screen bg-bg text-ink md:flex md:h-screen md:overflow-hidden">
+       <Toaster position="top-center" />
+       <aside className="hidden w-60 shrink-0 flex-col border-r border-line bg-surface-2 px-4 py-5 md:flex">
+-        <Brand />
++        <Brand link={link} />
+         <nav className="mt-8 flex flex-1 flex-col gap-1">
+           {items.map((item) => (
+             <NavButton key={item.id} item={item} active={page === item.id} onClick={() => openPage(item.id)} />
+@@ -129,7 +173,7 @@
+       </aside>
+       <div className="flex min-w-0 flex-1 flex-col md:overflow-hidden">
+         <header className="border-b border-line bg-surface px-4 py-3 md:hidden">
+-          <Brand compact />
++          <Brand compact link={link} />
+           <div className="mt-3 flex gap-2 overflow-x-auto">
+             {items.map((item) => (
+               <NavButton key={item.id} item={item} active={page === item.id} onClick={() => openPage(item.id)} />
+@@ -150,9 +194,13 @@
+                 {page === "entry"
+                   ? "一张单据可以加多个商品。每个商品有自己的供应商、销售格和拿货格。"
+                   : page === "detail"
+-                    ? "全部历史记录都留在本机，账户停用或删除后单据仍然在。"
++                    ? online
++                      ? "全部记录都在服务器上。同一账号在不同电脑看到的是同一份数据。"
++                      : "全部历史记录都留在本机，账户停用或删除后单据仍然在。"
+                     : page === "board"
+-                      ? "按出单时间汇总。退款以负数冲减销售额、业绩、毛利和提成。"
++                      ? online
++                        ? "按出单时间汇总。金额和数量以服务器计算结果为准。"
++                        : "按出单时间汇总。退款以负数冲减销售额、业绩、毛利和提成。"
+                       : "主账户不可被删除、停用或改密。管理员只能管理录入员。"}
+               </p>
+             </header>
+@@ -206,7 +254,9 @@
+   );
+ }
+ 
+-function Brand({ compact = false }: { compact?: boolean }) {
++function Brand({ compact = false, link = "local" }: { compact?: boolean; link?: "local" | "checking" | "up" | "down" }) {
++  const status = link === "up" ? "已连接" : link === "down" ? "无法连接" : link === "checking" ? "连接中" : "本机离线账本";
++  const dot = link === "up" ? "bg-sale" : link === "down" ? "bg-refund" : "bg-muted";
+   return (
+     <div className="flex items-center gap-3">
+       <span className="flex size-10 items-center justify-center rounded-2xl bg-primary text-primary-ink">
+@@ -214,7 +264,12 @@
+       </span>
+       <span>
+         <span className="block text-sm font-semibold">销售业绩统计</span>
+-        {compact ? null : <span className="block text-sm text-muted">本机离线账本</span>}
++        {compact ? null : (
++          <span className="mt-0.5 flex items-center gap-1.5 text-sm text-muted">
++            {link === "local" ? null : <span className={`inline-block size-2 rounded-full ${dot}`} />}
++            {status}
++          </span>
++        )}
+       </span>
+     </div>
+   );
+@@ -315,13 +370,13 @@
+   );
+ }
+ 
+-function Login({ db, onDone }: { db: SalesDb; onDone: (user: PublicUser) => void }) {
++function Login({ db, online, onDone }: { db: SalesDb; online: boolean; onDone: (user: PublicUser) => void }) {
+   const [username, setUsername] = useState("");
+   const [password, setPassword] = useState("");
+   const [error, setError] = useState("");
+   const [busy, setBusy] = useState(false);
+   return (
+-    <AuthShell title="登录" subtitle="账户和单据都在本机，不连接服务器。">
++    <AuthShell title="登录" subtitle={online ? "登录服务器账号。订单、统计和附件都保存在服务器上。" : "账户和单据都在本机，不连接服务器。"}>
+       <form
+         className="space-y-3"
+         onSubmit={(event) => {
+--- a/src/lib/sales/attachment-store.ts
++++ b/src/lib/sales/attachment-store.ts
+@@ -156,9 +156,12 @@
+ export async function readImage(relativePath: string): Promise<Uint8Array> {
+   if (isOnlineClient()) {
+     const bridge = onlineBridge();
++    if (!bridge) throw new Error("联网客户端环境不可用");
+     const id = serverAttachmentId(relativePath);
+-    if (!bridge || id == null) throw new Error("附件尚未上传");
+-    return bridge.readAttachment(id);
++    const raw = id != null ? await bridge.readAttachment(id) : await bridge.readPicked(relativePath);
++    const bytes = asBytes(raw);
++    if (!bytes) throw new Error("附件不存在");
++    return bytes;
+   }
+   const desktop = salesDesktop();
+   if (desktop) {
+@@ -174,8 +177,8 @@
+ export async function removeImage(relativePath: string): Promise<void> {
+   if (isOnlineClient()) {
+     const bridge = onlineBridge();
+-    const id = serverAttachmentId(relativePath);
+-    if (bridge && id != null) await bridge.deleteAttachment(id);
++    if (!bridge || serverAttachmentId(relativePath) != null) return;
++    if (/^[a-f0-9]{32}$/i.test(relativePath)) await bridge.forgetPicked(relativePath);
+     return;
+   }
+   const desktop = salesDesktop();
+@@ -186,12 +189,20 @@
+   await idbDelete(relativePath);
+ }
+ 
+-export async function openImage(relativePath: string): Promise<void> {
++export async function openImage(relativePath: string, fileName = ""): Promise<void> {
+   if (isOnlineClient()) {
+     const bridge = onlineBridge();
++    if (!bridge) throw new Error("联网客户端环境不可用");
+     const id = serverAttachmentId(relativePath);
+-    if (!bridge || id == null) throw new Error("附件尚未上传");
+-    await bridge.openAttachmentTemp(id, "");
++    if (id != null) {
++      await bridge.openAttachmentTemp(id, fileName || "image.jpg");
++      return;
++    }
++    const bytes = await readImage(relativePath);
++    const url = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: imageMime(fileName || relativePath) }));
++    const opened = window.open(url, "_blank", "noopener");
++    if (!opened) throw new Error("无法打开原图");
++    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+     return;
+   }
+   const desktop = salesDesktop();
+--- a/src/lib/sales/online-api.ts
++++ b/src/lib/sales/online-api.ts
+@@ -25,13 +25,13 @@
+   login(username: string, password: string): Promise<{ token: string; user: OnlineUser }>;
+   logout(): Promise<{ ok: boolean }>;
+   me(): Promise<{ user: OnlineUser }>;
++  health(): Promise<{ ok: boolean }>;
+   changePassword(currentPassword: string, newPassword: string): Promise<{ ok: boolean }>;
+   listAccounts(): Promise<{ users: OnlineUser[] }>;
+   createAccount(username: string, password: string, role: string): Promise<{ user: OnlineUser }>;
+   disableAccount(id: number): Promise<{ ok: boolean }>;
+   enableAccount(id: number): Promise<{ ok: boolean }>;
+   assignRole(id: number, role: string): Promise<{ ok: boolean }>;
+-  updateAccount(id: number, patch: { username?: string }): Promise<{ user: OnlineUser }>;
+   listOrders(query: Record<string, string>): Promise<{ orders: unknown[]; total?: number; hasMore?: boolean }>;
+   getOrder(id: number): Promise<{ order: unknown; items: unknown[] }>;
+   createOrder(payload: unknown): Promise<{ orderId: number; totals: unknown }>;
+@@ -43,6 +43,8 @@
+   pickImages(): Promise<PickedImage[]>;
+   uploadAttachment(payload: OnlineAttachmentUpload): Promise<{ attachments: unknown[] }>;
+   readAttachment(id: number): Promise<Uint8Array>;
++  readPicked(handle: string): Promise<Uint8Array>;
++  forgetPicked(handle: string): Promise<{ ok: boolean }>;
+   deleteAttachment(id: number): Promise<{ ok: boolean }>;
+   deleteItemAttachments(itemId: number): Promise<{ ok: boolean }>;
+   deleteOrderAttachments(orderId: number): Promise<{ ok: boolean }>;
+--- a/src/lib/sales/online-db.ts
++++ b/src/lib/sales/online-db.ts
+@@ -1,295 +1,323 @@
+-import type { SalesDb } from './db';
+-import type {
+-  AttachmentRecord,
+-  NameHint,
+-  OrderInput,
+-  OrderItem,
+-  PublicUser,
+-  SalesOrder,
+-  Stats,
+-  Grade,
+-  PersonStat,
+-  DayStat,
+-} from './types';
+-import { formatCents, parseQty } from './money';
+-import { onlineBridge } from './online-api';
++import type { SalesDb } from "./db.ts";
++import type { AttachmentRecord, DayStat, Grade, NameHint, OrderInput, PersonStat, PublicUser, SalesOrder, Stats } from "./types.ts";
++import { onlineBridge } from "./online-api.ts";
++import { buildOrderBody, displayOrderTime, isAttachmentType, mapServerItem, mapServerOrder } from "./wire.ts";
+ 
+ type Raw = Record<string, unknown>;
+-const s = (v: unknown): string => (v == null ? '' : String(v));
+-const n = (v: unknown): number => Number(v ?? 0);
+-const big = (v: unknown): bigint => {
++
++const text = (value: unknown): string => (value == null ? "" : String(value));
++const num = (value: unknown): number => Number(value ?? 0);
++const big = (value: unknown): bigint => {
+   try {
+-    return BigInt(s(v) || '0');
++    return BigInt(text(value) || "0");
+   } catch {
+     return 0n;
+   }
+ };
+-const parseArr = (v: unknown): string[] => {
+-  try {
+-    const p = JSON.parse(s(v) || '[]');
+-    return Array.isArray(p) ? p.map((x) => String(x)) : [];
+-  } catch {
+-    return [];
+-  }
+-};
+ 
+-function mapUser(r: Raw): PublicUser {
+-  const active = r.isActive === true || r.is_active === true || String(r.isActive ?? r.is_active) === 'true';
+-  return {
+-    id: n(r.id),
+-    username: s(r.username),
+-    role: s(r.role) as PublicUser['role'],
+-    isActive: active,
+-    createdAt: s(r.createdAt ?? r.created_at),
+-    updatedAt: s(r.updatedAt ?? r.updated_at),
+-  };
++function asBool(value: unknown): boolean {
++  return value === true || value === 1 || value === "1" || value === "true" || value === "t";
+ }
+ 
+-function mapItem(r: Raw): OrderItem {
+-  const actual = big(r.actual_sales_amount);
+-  const performance = big(r.performance_sales_amount);
+-  const cost = big(r.purchase_cost);
+-  const profit = big(r.gross_profit);
+-  const commission = big(r.commission_amount);
++function mapUser(row: Raw): PublicUser {
+   return {
+-    id: n(r.id),
+-    productCode: s(r.product_code),
+-    productName: s(r.product_name),
+-    customerProductCode: s(r.customer_product_code),
+-    supplierProductCode: s(r.supplier_product_code),
+-    specification: s(r.specification),
+-    fabricWidth: s(r.fabric_width),
+-    fabricWeight: s(r.fabric_weight),
+-    unit: s(r.unit),
+-    clientKey: s(r.client_key),
+-    color: s(r.color),
+-    supplierName: s(r.supplier_name),
+-    salesPackageCount: n(r.sales_package_count),
+-    salesQuantities: parseArr(r.sales_quantity_details),
+-    salesTotalQuantity: s(r.sales_total_quantity),
+-    salesUnitPrice: s(r.sales_unit_price),
+-    purchasePackageCount: n(r.purchase_package_count),
+-    purchaseQuantities: parseArr(r.purchase_quantity_details),
+-    purchaseTotalQuantity: s(r.purchase_total_quantity),
+-    purchaseUnitPrice: s(r.purchase_unit_price),
+-    grade: s(r.grade) as Grade,
+-    gradeMultiplier: s(r.grade_multiplier),
+-    commissionPercent: s(r.commission_rate),
+-    actualSalesAmount: formatCents(actual),
+-    performanceSalesAmount: formatCents(performance),
+-    purchaseCost: formatCents(cost),
+-    grossProfit: formatCents(profit),
+-    commissionAmount: formatCents(commission),
+-    actualCents: actual,
+-    performanceCents: performance,
+-    costCents: cost,
+-    profitCents: profit,
+-    commissionCents: commission,
++    id: num(row.id),
++    username: text(row.username),
++    role: text(row.role) as PublicUser["role"],
++    isActive: asBool(row.isActive ?? row.is_active),
++    createdAt: displayOrderTime(text(row.createdAt ?? row.created_at)),
++    updatedAt: displayOrderTime(text(row.updatedAt ?? row.updated_at)),
+   };
+ }
+ 
+-function totalsOf(items: OrderItem[]) {
+-  return items.reduce(
+-    (sum, it) => ({
+-      actualCents: sum.actualCents + it.actualCents,
+-      performanceCents: sum.performanceCents + it.performanceCents,
+-      costCents: sum.costCents + it.costCents,
+-      profitCents: sum.profitCents + it.profitCents,
+-      commissionCents: sum.commissionCents + it.commissionCents,
+-    }),
+-    { actualCents: 0n, performanceCents: 0n, costCents: 0n, profitCents: 0n, commissionCents: 0n },
+-  );
++function mapHints(items: unknown, linked: boolean): NameHint[] {
++  const list = Array.isArray(items) ? items : [];
++  return list
++    .map((raw) => {
++      const row = raw as Raw;
++      return {
++        name: text(row.name),
++        count: num(row.count),
++        lastUsed: text(row.last_used ?? row.lastUsed),
++        linked,
++      };
++    })
++    .filter((hint) => hint.name.length > 0);
++}
++
++function mergeLinked(linked: NameHint[], all: NameHint[]): NameHint[] {
++  const names = new Set(linked.map((hint) => hint.name));
++  return [
++    ...linked.map((hint) => ({ ...hint, linked: true })),
++    ...all.filter((hint) => !names.has(hint.name)).map((hint) => ({ ...hint, linked: false })),
++  ];
+ }
+ 
+-function mapOrder(o: Raw, items: OrderItem[], attachmentCount: number): SalesOrder {
++function mapAttachment(row: Raw): AttachmentRecord | null {
++  const kind = text(row.attachment_type ?? row.attachmentType);
++  if (!isAttachmentType(kind)) return null;
++  const id = num(row.id);
+   return {
+-    id: n(o.id),
+-    recordType: s(o.record_type) as SalesOrder['recordType'],
+-    orderTime: s(o.order_time),
+-    salespersonName: s(o.salesperson_name),
+-    customerName: s(o.customer_name),
+-    remark: s(o.remark),
+-    items,
+-    itemCount: items.length,
+-    ...totalsOf(items),
+-    createdByUserId: o.created_by_user_id == null ? null : n(o.created_by_user_id),
+-    createdByName: s(o.created_by_name),
+-    createdAt: s(o.created_at),
+-    updatedByUserId: o.updated_by_user_id == null ? null : n(o.updated_by_user_id),
+-    updatedByName: s(o.updated_by_name),
+-    updatedAt: s(o.updated_at),
+-    attachmentCount,
++    id,
++    orderId: num(row.order_id ?? row.orderId),
++    orderItemId: row.order_item_id == null && row.orderItemId == null ? null : num(row.order_item_id ?? row.orderItemId),
++    attachmentType: kind,
++    fileName: text(row.file_name ?? row.fileName),
++    storedFileName: text(row.stored_file_name ?? ""),
++    relativePath: `server:${id}`,
++    createdByUserId: row.created_by_user_id == null && row.createdByUserId == null ? null : num(row.created_by_user_id ?? row.createdByUserId),
++    createdByName: text(row.created_by_name ?? row.createdByName),
++    createdAt: displayOrderTime(text(row.created_at ?? row.createdAt)),
+   };
+ }
+ 
+-function mapAttachment(r: Raw): AttachmentRecord {
+-  const id = n(r.id);
++function emptyGrade(): Record<Grade, bigint> {
++  return { A: 0n, B: 0n, C: 0n, D: 0n };
++}
++
++function mapServerStats(raw: Raw): Stats {
++  const totals = (raw.totals as Raw) || {};
++  const byGrade = emptyGrade();
++  const gradeVolume = emptyGrade();
++  for (const row of (raw.byGrade as Raw[]) || []) {
++    const grade = text(row.grade) as Grade;
++    if (grade !== "A" && grade !== "B" && grade !== "C" && grade !== "D") continue;
++    const actual = big(row.actual);
++    byGrade[grade] = actual;
++    gradeVolume[grade] = actual < 0n ? -actual : actual;
++  }
+   return {
+-    id,
+-    orderId: n(r.order_id),
+-    orderItemId: r.order_item_id == null ? null : n(r.order_item_id),
+-    attachmentType: s(r.attachment_type) as AttachmentRecord['attachmentType'],
+-    fileName: s(r.file_name),
+-    storedFileName: s(r.stored_file_name ?? ''),
+-    relativePath: 'server:' + id,
+-    createdByUserId: r.created_by_user_id == null ? null : n(r.created_by_user_id),
+-    createdByName: s(r.created_by_name),
+-    createdAt: s(r.created_at),
++    actualCents: big(totals.actual),
++    performanceCents: big(totals.performance),
++    profitCents: big(totals.profit),
++    commissionCents: big(totals.commission),
++    saleCount: num(totals.sale_count),
++    refundCount: num(totals.refund_count),
++    saleAmountCents: big(totals.sale_amount),
++    refundAmountCents: big(totals.refund_amount),
++    byPerson: ((raw.byPerson as Raw[]) || []).map((row) => {
++      const performance = big(row.performance);
++      return {
++        name: text(row.name),
++        actualCents: big(row.actual),
++        performanceCents: performance,
++        profitCents: big(row.profit),
++        commissionCents: big(row.commission),
++        salePerformanceCents: performance > 0n ? performance : 0n,
++        refundPerformanceCents: performance < 0n ? performance : 0n,
++        gradeActual: emptyGrade(),
++        saleCount: num(row.sale_count),
++        refundCount: num(row.refund_count),
++      };
++    }),
++    byGrade,
++    gradeVolume,
++    byDay: ((raw.byDay as Raw[]) || []).map((row) => ({
++      day: text(row.day),
++      saleCents: big(row.sale_amount),
++      refundCents: big(row.refund_amount),
++      profitCents: big(row.profit),
++    })),
+   };
+ }
+ 
+-function pickAttachments(res: { attachments?: unknown[] } | null): AttachmentRecord[] {
+-  return ((res?.attachments as Raw[]) || []).map(mapAttachment);
++function sessionExpired(error: unknown): boolean {
++  return error instanceof Error && error.message.includes("登录已失效");
++}
++
++function raise(error: unknown): never {
++  if (sessionExpired(error) && typeof window !== "undefined") {
++    window.dispatchEvent(new CustomEvent("sales-auth-expired"));
++  }
++  throw error instanceof Error ? error : new Error("服务器暂时无法处理，请稍后重试");
+ }
+ 
+ export async function createOnlineDatabase(): Promise<SalesDb> {
+   const bridge = onlineBridge();
+-  if (!bridge) throw new Error('联网客户端环境不可用');
++  if (!bridge) throw new Error("联网客户端环境不可用");
+ 
+   let users: PublicUser[] = [];
+   let orders: SalesOrder[] = [];
+   let attachmentsByOrder: Record<number, AttachmentRecord[]> = {};
+   let current: PublicUser | null = null;
+-
+   let salespersonCache: NameHint[] = [];
+   let customerCache: NameHint[] = [];
+   let productNameCache: NameHint[] = [];
+   const customerBySalesperson = new Map<string, NameHint[]>();
+   const salespersonByCustomer = new Map<string, NameHint[]>();
+   const statsCache = new Map<string, Stats>();
++  const inflight = new Set<string>();
++  const listeners = new Set<() => void>();
++
++  function notify() {
++    for (const listener of listeners) listener();
++  }
+ 
+   function statsKey(query: { dateFrom?: string; dateTo?: string; salesperson?: string }): string {
+-    return [query.dateFrom || '', query.dateTo || '', query.salesperson || ''].join('|');
++    return [query.dateFrom || "", query.dateTo || "", query.salesperson || ""].join("|");
+   }
+ 
+   async function refreshUsers() {
+     try {
+       const res = await bridge!.listAccounts();
+-      users = (res.users || []).map((u) => mapUser(u as unknown as Raw));
+-    } catch {
++      users = (res.users || []).map((user) => mapUser(user as unknown as Raw));
++    } catch (error) {
++      if (sessionExpired(error)) raise(error);
+       users = current ? [current] : [];
+     }
+   }
+ 
+   async function refreshOrders() {
+     const built: SalesOrder[] = [];
++    const files: Record<number, AttachmentRecord[]> = {};
+     let offset = 0;
+     const limit = 200;
+-    for (let page = 0; page < 200; page += 1) {
++    for (let page = 0; page < 50; page += 1) {
+       const listRes = await bridge!.listOrders({ limit: String(limit), offset: String(offset) });
+       const summaries = (listRes.orders || []) as Raw[];
+-      for (const sum of summaries) {
+-        const id = n(sum.id);
++      for (const summary of summaries) {
++        const id = num(summary.id);
+         try {
+           const detail = await bridge!.getOrder(id);
+-          const items = ((detail.items || []) as Raw[]).map(mapItem);
+-          built.push(mapOrder(sum, items, n(sum.attachment_count)));
+-        } catch {
+-          built.push(mapOrder(sum, [], n(sum.attachment_count)));
++          const items = ((detail.items || []) as Raw[]).map(mapServerItem);
++          const count = num(summary.attachment_count ?? summary.attachmentCount);
++          built.push(mapServerOrder((detail.order as Raw) || summary, items, count));
++          if (count > 0) {
++            const listed = await bridge!.listAttachments(id);
++            files[id] = ((listed.attachments || []) as Raw[]).map(mapAttachment).filter((row): row is AttachmentRecord => row != null);
++          } else {
++            files[id] = [];
++          }
++        } catch (error) {
++          if (sessionExpired(error)) raise(error);
++          built.push(mapServerOrder(summary, [], num(summary.attachment_count)));
+         }
+       }
+-      const hasMore = (listRes as { hasMore?: boolean }).hasMore === true;
+       offset += summaries.length;
+-      if (!hasMore || summaries.length === 0) break;
++      if (listRes.hasMore !== true || summaries.length === 0) break;
+     }
+     orders = built;
++    attachmentsByOrder = files;
+   }
+ 
+   async function refreshSuggestions() {
+     try {
+-      const sp = await bridge!.suggestions('salespersons', {});
+-      salespersonCache = (sp.items || []) as NameHint[];
+-    } catch {
++      salespersonCache = mapHints((await bridge!.suggestions("salespersons", {})).items, false);
++    } catch (error) {
++      if (sessionExpired(error)) raise(error);
+       salespersonCache = [];
+     }
+     try {
+-      const cu = await bridge!.suggestions('customers', {});
+-      customerCache = (cu.items || []) as NameHint[];
+-    } catch {
++      customerCache = mapHints((await bridge!.suggestions("customers", {})).items, false);
++    } catch (error) {
++      if (sessionExpired(error)) raise(error);
+       customerCache = [];
+     }
+     try {
+-      const pn = await bridge!.suggestions('product-names', {});
+-      productNameCache = (pn.items || []) as NameHint[];
+-    } catch {
++      productNameCache = mapHints((await bridge!.suggestions("product-names", {})).items, false);
++    } catch (error) {
++      if (sessionExpired(error)) raise(error);
+       productNameCache = [];
+     }
++    customerBySalesperson.clear();
++    salespersonByCustomer.clear();
++    statsCache.clear();
+   }
+ 
+   async function refreshAll() {
+     await refreshUsers();
+     await refreshOrders();
+     await refreshSuggestions();
++    notify();
+   }
+ 
+-  function localHintFilter(list: NameHint[], keyword: string): NameHint[] {
+-    const kw = keyword.trim();
+-    if (!kw) return list;
+-    return list.filter((x) => x.name.includes(kw));
++  function rememberOrder(order: SalesOrder | undefined): SalesOrder {
++    if (!order || !order.id) throw new Error("服务器没有返回订单，请重新打开后再试");
++    return order;
+   }
+ 
+   const db = {
++    subscribe(listener: () => void) {
++      listeners.add(listener);
++      return () => listeners.delete(listener);
++    },
+     hasOwner(): boolean {
+       return true;
+     },
+     getUser(id: number): PublicUser | null {
+       if (current && current.id === id) return current;
+-      return users.find((u) => u.id === id) ?? null;
++      return users.find((user) => user.id === id) ?? null;
+     },
+     listUsers(): PublicUser[] {
+       return users.slice();
+     },
+     listOrders(query: Record<string, unknown> = {}): SalesOrder[] {
+       let rows = orders.slice();
+-      const kw = s(query.keyword).trim();
+-      if (kw) {
++      const keyword = text(query.keyword).trim();
++      if (keyword) {
+         rows = rows.filter(
+-          (o) =>
+-            o.salespersonName.includes(kw) ||
+-            o.customerName.includes(kw) ||
+-            o.items.some((it) => it.productName.includes(kw)),
++          (order) =>
++            order.salespersonName.includes(keyword) ||
++            order.customerName.includes(keyword) ||
++            order.items.some((item) => item.productName.includes(keyword) || item.productCode.includes(keyword)),
+         );
+       }
+-      if (query.recordType) rows = rows.filter((o) => o.recordType === query.recordType);
+-      if (query.salesperson) rows = rows.filter((o) => o.salespersonName === query.salesperson);
+-      if (query.customer) rows = rows.filter((o) => o.customerName === query.customer);
+-      const from = s(query.dateFrom);
+-      const to = s(query.dateTo);
+-      if (from) rows = rows.filter((o) => o.orderTime >= from);
+-      if (to) rows = rows.filter((o) => o.orderTime <= to + '~');
++      if (query.recordType) rows = rows.filter((order) => order.recordType === query.recordType);
++      if (query.salesperson) rows = rows.filter((order) => order.salespersonName === query.salesperson);
++      if (query.customer) rows = rows.filter((order) => order.customerName === query.customer);
++      const from = text(query.dateFrom);
++      const to = text(query.dateTo);
++      if (from) rows = rows.filter((order) => order.orderTime >= from);
++      if (to) rows = rows.filter((order) => order.orderTime <= `${to}~`);
+       return rows;
+     },
+     getOrder(id: number): SalesOrder | null {
+-      return orders.find((o) => o.id === id) ?? null;
++      return orders.find((order) => order.id === id) ?? null;
+     },
+     listAttachments(orderId: number): AttachmentRecord[] {
+       return (attachmentsByOrder[orderId] || []).slice();
+     },
+-    suggestSalespeople(customer = ''): NameHint[] {
++    suggestSalespeople(customer = ""): NameHint[] {
+       const key = customer.trim();
+-      if (!key) return localHintFilter(salespersonCache, '');
+-      void bridge!
+-        .suggestions('salespersons-by-customer', { customer: key })
+-        .then((res) => salespersonByCustomer.set(key, (res.items || []) as NameHint[]))
+-        .catch(() => undefined);
+-      return salespersonByCustomer.get(key) ?? [];
++      if (!key) return salespersonCache.slice();
++      const cached = salespersonByCustomer.get(key);
++      const flight = `sp:${key}`;
++      if (!inflight.has(flight)) {
++        inflight.add(flight);
++        void bridge!
++          .suggestions("salespersons-by-customer", { customer: key })
++          .then((res) => {
++            salespersonByCustomer.set(key, mergeLinked(mapHints(res.items, true), salespersonCache));
++            notify();
++          })
++          .catch((error) => {
++            if (sessionExpired(error) && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("sales-auth-expired"));
++          })
++          .finally(() => inflight.delete(flight));
++      }
++      return cached ?? salespersonCache.map((hint) => ({ ...hint, linked: false }));
+     },
+-    suggestCustomers(salesperson = ''): NameHint[] {
++    suggestCustomers(salesperson = ""): NameHint[] {
+       const key = salesperson.trim();
+-      if (!key) return localHintFilter(customerCache, '');
+-      void bridge!
+-        .suggestions('customers-by-salesperson', { salesperson: key })
+-        .then((res) => customerBySalesperson.set(key, (res.items || []) as NameHint[]))
+-        .catch(() => undefined);
+-      return customerBySalesperson.get(key) ?? [];
++      if (!key) return customerCache.slice();
++      const cached = customerBySalesperson.get(key);
++      const flight = `cu:${key}`;
++      if (!inflight.has(flight)) {
++        inflight.add(flight);
++        void bridge!
++          .suggestions("customers-by-salesperson", { salesperson: key })
++          .then((res) => {
++            customerBySalesperson.set(key, mergeLinked(mapHints(res.items, true), customerCache));
++            notify();
++          })
++          .catch((error) => {
++            if (sessionExpired(error) && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("sales-auth-expired"));
++          })
++          .finally(() => inflight.delete(flight));
++      }
++      return cached ?? customerCache.map((hint) => ({ ...hint, linked: false }));
+     },
+     suggestProductNames(): NameHint[] {
+-      void bridge!
+-        .suggestions('product-names', {})
+-        .then((res) => {
+-          productNameCache = (res.items || []) as NameHint[];
+-        })
+-        .catch(() => undefined);
+       return productNameCache.slice();
+     },
+     stats(query: { dateFrom?: string; dateTo?: string; salesperson?: string } = {}): Stats {
+@@ -298,30 +326,38 @@
+       if (query.dateFrom) params.dateFrom = query.dateFrom;
+       if (query.dateTo) params.dateTo = query.dateTo;
+       if (query.salesperson) params.salesperson = query.salesperson;
+-      void bridge!
+-        .stats(params)
+-        .then((res) => {
+-          statsCache.set(key, mapServerStats(res as unknown as Raw));
+-        })
+-        .catch(() => undefined);
+-      const cached = statsCache.get(key);
+-      if (cached) return cached;
+-      return computeStatsFromOrders(db.listOrders({
+-        dateFrom: query.dateFrom,
+-        dateTo: query.dateTo,
+-        salesperson: query.salesperson,
+-      }));
++      const flight = `stats:${key}`;
++      if (!statsCache.has(key) && !inflight.has(flight)) {
++        inflight.add(flight);
++        void bridge!
++          .stats(params)
++          .then((res) => {
++            const mapped = mapServerStats(res as unknown as Raw);
++            fillPersonGrades(mapped, db.listOrders(query));
++            statsCache.set(key, mapped);
++            notify();
++          })
++          .catch((error) => {
++            if (sessionExpired(error) && typeof window !== "undefined") window.dispatchEvent(new CustomEvent("sales-auth-expired"));
++          })
++          .finally(() => inflight.delete(flight));
++      }
++      return statsCache.get(key) ?? fallbackStats(db.listOrders(query));
+     },
+     async login(username: string, password: string): Promise<PublicUser> {
+-      const res = await bridge!.login(username, password);
+-      current = mapUser(res.user as unknown as Raw);
+-      await refreshAll();
+-      return current;
++      try {
++        const res = await bridge!.login(username, password);
++        current = mapUser(res.user as unknown as Raw);
++        await refreshAll();
++        return current;
++      } catch (error) {
++        raise(error);
++      }
+     },
+     async restoreSession(): Promise<PublicUser | null> {
+       try {
+-        const meRes = await bridge!.me();
+-        current = mapUser(meRes.user as unknown as Raw);
++        const me = await bridge!.me();
++        current = mapUser(me.user as unknown as Raw);
+         await refreshAll();
+         return current;
+       } catch {
+@@ -340,191 +376,181 @@
+         users = [];
+         orders = [];
+         attachmentsByOrder = {};
++        statsCache.clear();
+       }
+     },
+-    async createOwner(username: string, password: string): Promise<PublicUser> {
+-      const res = await bridge!.createAccount(username, password, 'operator');
+-      current = mapUser(res.user as unknown as Raw);
+-      await refreshAll();
+-      return current;
++    async createOwner(): Promise<PublicUser> {
++      throw new Error("请使用服务器已有账号登录");
+     },
+     async createUser(
+-      actor: PublicUser,
+-      input: { username: string; password: string; role: PublicUser['role'] },
++      _actor: PublicUser,
++      input: { username: string; password: string; role: PublicUser["role"] },
+     ): Promise<PublicUser> {
+-      const res = await bridge!.createAccount(input.username, input.password, input.role);
+-      await refreshAll();
+-      return mapUser(res.user as unknown as Raw);
++      try {
++        const res = await bridge!.createAccount(input.username, input.password, input.role);
++        await refreshAll();
++        return mapUser(res.user as unknown as Raw);
++      } catch (error) {
++        raise(error);
++      }
+     },
+     async updateUser(
+-      actor: PublicUser,
++      _actor: PublicUser,
+       id: number,
+-      patch: { username?: string; role?: PublicUser['role']; isActive?: boolean },
++      patch: { username?: string; password?: string; role?: PublicUser["role"]; isActive?: boolean },
+     ): Promise<void> {
+-      if (patch.role) await bridge!.assignRole(id, patch.role);
+-      if (patch.isActive === false) await bridge!.disableAccount(id);
+-      if (patch.isActive === true) await bridge!.enableAccount(id);
+-      if (patch.username) await bridge!.updateAccount(id, { username: patch.username });
+-      await refreshAll();
+-    },
+-    async deleteUser(actor: PublicUser, targetId: number): Promise<void> {
+-      await bridge!.disableAccount(targetId);
+-      await refreshAll();
+-    },
+-    async changeOwnPassword(userId: number, currentPassword: string, next: string): Promise<void> {
+-      await bridge!.changePassword(currentPassword, next);
+-    },
+-    async updateOwnUsername(userId: number, username: string): Promise<PublicUser> {
+-      const res = await bridge!.updateAccount(userId, { username });
+-      current = mapUser(res.user as unknown as Raw);
+-      await refreshUsers();
+-      return current;
++      const existing = users.find((user) => user.id === id) ?? (current?.id === id ? current : null);
++      if (patch.username && existing && patch.username.trim() !== existing.username) {
++        throw new Error("服务器不支持修改用户名");
++      }
++      if (patch.password) throw new Error("请让对方在「修改我的密码」中自行修改");
++      try {
++        if (patch.role && existing && patch.role !== existing.role) await bridge!.assignRole(id, patch.role);
++        if (patch.isActive === false) await bridge!.disableAccount(id);
++        if (patch.isActive === true) await bridge!.enableAccount(id);
++        await refreshAll();
++      } catch (error) {
++        raise(error);
++      }
++    },
++    async deleteUser(_actor: PublicUser, targetId: number): Promise<void> {
++      try {
++        await bridge!.disableAccount(targetId);
++        await refreshAll();
++      } catch (error) {
++        raise(error);
++      }
+     },
+-    async insertOrder(actor: PublicUser, input: OrderInput): Promise<SalesOrder> {
+-      const payload = buildOrderPayload(input);
+-      const res = await bridge!.createOrder(payload);
+-      await refreshAll();
+-      return (orders.find((o) => o.id === n(res.orderId)) as SalesOrder) ?? ({} as SalesOrder);
+-    },
+-    async updateOrder(actor: PublicUser, id: number, input: OrderInput): Promise<SalesOrder> {
+-      const payload = buildOrderPayload(input);
+-      await bridge!.updateOrder(id, payload);
+-      await refreshAll();
+-      return (orders.find((o) => o.id === id) as SalesOrder) ?? ({} as SalesOrder);
+-    },
+-    async deleteOrder(actor: PublicUser, id: number): Promise<string[]> {
+-      const paths: string[] = [];
+-      if (attachmentsByOrder[id]) for (const a of attachmentsByOrder[id]) paths.push(a.relativePath);
+-      await bridge!.deleteOrder(id);
+-      delete attachmentsByOrder[id];
+-      await refreshAll();
+-      return paths;
++    async changeOwnPassword(_userId: number, currentPassword: string, next: string): Promise<void> {
++      try {
++        await bridge!.changePassword(currentPassword, next);
++      } catch (error) {
++        raise(error);
++      }
++    },
++    async updateOwnUsername(): Promise<PublicUser> {
++      throw new Error("服务器不支持修改用户名");
++    },
++    async insertOrder(_actor: PublicUser, input: OrderInput): Promise<SalesOrder> {
++      try {
++        const res = await bridge!.createOrder(buildOrderBody(input, "create"));
++        await refreshAll();
++        return rememberOrder(orders.find((order) => order.id === num(res.orderId)));
++      } catch (error) {
++        raise(error);
++      }
++    },
++    async updateOrder(_actor: PublicUser, id: number, input: OrderInput): Promise<SalesOrder> {
++      try {
++        await bridge!.updateOrder(id, buildOrderBody(input, "update"));
++        await refreshAll();
++        const order = rememberOrder(orders.find((row) => row.id === id));
++        return { ...order, removedAttachmentPaths: [] };
++      } catch (error) {
++        raise(error);
++      }
++    },
++    async deleteOrder(_actor: PublicUser, id: number): Promise<string[]> {
++      try {
++        await bridge!.deleteOrder(id);
++        delete attachmentsByOrder[id];
++        await refreshAll();
++        return [];
++      } catch (error) {
++        raise(error);
++      }
+     },
+     async addAttachment(
+-      actor: PublicUser,
++      _actor: PublicUser,
+       record: {
+         orderId: number;
+         orderItemId: number | null;
+-        attachmentType: AttachmentRecord['attachmentType'];
++        attachmentType: AttachmentRecord["attachmentType"];
+         fileName: string;
+         storedFileName: string;
+         relativePath: string;
+       },
+     ): Promise<AttachmentRecord> {
+-      const res = await bridge!.uploadAttachment({
+-        orderId: record.orderId,
+-        orderItemId: record.orderItemId,
+-        attachmentType: record.attachmentType,
+-        handle: record.relativePath,
+-      } as never);
+-      const list = await bridge!.listAttachments(record.orderId);
+-      attachmentsByOrder[record.orderId] = pickAttachments(list);
+-      const created = pickAttachments(res);
+-      return created[0] ?? attachmentsByOrder[record.orderId][0];
++      try {
++        await bridge!.uploadAttachment({
++          orderId: record.orderId,
++          orderItemId: record.orderItemId,
++          attachmentType: record.attachmentType,
++          handle: record.relativePath,
++        });
++        const listed = await bridge!.listAttachments(record.orderId);
++        const rows = ((listed.attachments || []) as Raw[]).map(mapAttachment).filter((row): row is AttachmentRecord => row != null);
++        attachmentsByOrder[record.orderId] = rows;
++        const order = orders.find((row) => row.id === record.orderId);
++        if (order) order.attachmentCount = rows.length;
++        notify();
++        const created = [...rows].reverse().find((row) => row.fileName === record.fileName && row.attachmentType === record.attachmentType);
++        if (!created) throw new Error("附件已上传，但列表没有刷新，请重新打开订单");
++        return created;
++      } catch (error) {
++        raise(error);
++      }
+     },
+     async deleteAttachment(id: number): Promise<string> {
+       let orderId = 0;
+-      let path = '';
+-      for (const [oid, list] of Object.entries(attachmentsByOrder)) {
+-        const hit = list.find((a) => a.id === id);
++      let path = `server:${id}`;
++      for (const [key, list] of Object.entries(attachmentsByOrder)) {
++        const hit = list.find((row) => row.id === id);
+         if (hit) {
+-          orderId = Number(oid);
++          orderId = Number(key);
+           path = hit.relativePath;
+           break;
+         }
+       }
+-      await bridge!.deleteAttachment(id);
+-      if (orderId) {
+-        const list = await bridge!.listAttachments(orderId);
+-        attachmentsByOrder[orderId] = pickAttachments(list);
++      try {
++        await bridge!.deleteAttachment(id);
++        if (orderId) {
++          const listed = await bridge!.listAttachments(orderId);
++          const rows = ((listed.attachments || []) as Raw[]).map(mapAttachment).filter((row): row is AttachmentRecord => row != null);
++          attachmentsByOrder[orderId] = rows;
++          const order = orders.find((row) => row.id === orderId);
++          if (order) order.attachmentCount = rows.length;
++        }
++        notify();
++        return path;
++      } catch (error) {
++        raise(error);
+       }
+-      return path;
+     },
+     exportBytes(): Uint8Array {
+       return new Uint8Array(0);
+     },
+-  } as unknown as SalesDb;
+-
+-  function buildOrderPayload(input: OrderInput) {
+-    return {
+-      recordType: input.recordType,
+-      orderTime: input.orderTime,
+-      salespersonName: input.salespersonName,
+-      customerName: input.customerName,
+-      remark: input.remark,
+-      items: input.items.map((it) => ({
+-        clientKey: it.clientKey,
+-        productCode: it.productCode,
+-        productName: it.productName,
+-        customerProductCode: it.customerProductCode,
+-        supplierProductCode: it.supplierProductCode,
+-        specification: it.specification,
+-        fabricWidth: it.fabricWidth,
+-        fabricWeight: it.fabricWeight,
+-        unit: it.unit,
+-        color: it.color,
+-        supplierName: it.supplierName,
+-        salesQuantities: it.salesQuantities,
+-        salesUnitPrice: it.salesUnitPrice,
+-        purchaseQuantities: it.purchaseQuantities,
+-        purchaseUnitPrice: it.purchaseUnitPrice,
+-        grade: it.grade,
+-        commissionPercent: it.commissionPercent,
+-      })),
+-    };
+-  }
+-
+-  (db as unknown as { refresh: () => Promise<void> }).refresh = refreshAll;
++  };
+ 
+-  return db;
++  return db as unknown as SalesDb;
+ }
+ 
+-function mapServerStats(raw: Raw): Stats {
+-  const t = (raw.totals as Raw) || {};
+-  const byGrade = { A: 0n, B: 0n, C: 0n, D: 0n } as Record<Grade, bigint>;
+-  const gradeVolume = { A: 0n, B: 0n, C: 0n, D: 0n } as Record<Grade, bigint>;
+-  for (const g of (raw.byGrade as Raw[]) || []) {
+-    const key = s(g.grade) as Grade;
+-    if (key === 'A' || key === 'B' || key === 'C' || key === 'D') {
+-      byGrade[key] = big(g.actual);
+-      gradeVolume[key] = big(g.volume);
++function fillPersonGrades(stats: Stats, rows: SalesOrder[]) {
++  const grades = new Map<string, Record<Grade, bigint>>();
++  const salePerf = new Map<string, bigint>();
++  const refundPerf = new Map<string, bigint>();
++  for (const order of rows) {
++    const refund = order.recordType === "refund";
++    for (const item of order.items) {
++      const bucket = grades.get(order.salespersonName) ?? emptyGrade();
++      bucket[item.grade] += item.actualCents;
++      grades.set(order.salespersonName, bucket);
++      if (refund) refundPerf.set(order.salespersonName, (refundPerf.get(order.salespersonName) ?? 0n) + item.performanceCents);
++      else salePerf.set(order.salespersonName, (salePerf.get(order.salespersonName) ?? 0n) + item.performanceCents);
++    }
++  }
++  for (const person of stats.byPerson) {
++    person.gradeActual = grades.get(person.name) ?? emptyGrade();
++    if (salePerf.has(person.name) || refundPerf.has(person.name)) {
++      person.salePerformanceCents = salePerf.get(person.name) ?? 0n;
++      person.refundPerformanceCents = refundPerf.get(person.name) ?? 0n;
+     }
+   }
+-  return {
+-    actualCents: big(t.actual),
+-    performanceCents: big(t.performance),
+-    profitCents: big(t.profit),
+-    commissionCents: big(t.commission),
+-    saleCount: n(t.sale_count),
+-    refundCount: n(t.refund_count),
+-    saleAmountCents: big(t.sale_amount),
+-    refundAmountCents: big(t.refund_amount),
+-    byPerson: ((raw.byPerson as Raw[]) || []).map((p) => ({
+-      name: s(p.name),
+-      actualCents: big(p.actual),
+-      performanceCents: big(p.performance),
+-      profitCents: big(p.profit),
+-      commissionCents: big(p.commission),
+-      salePerformanceCents: 0n,
+-      refundPerformanceCents: 0n,
+-      gradeActual: { A: 0n, B: 0n, C: 0n, D: 0n } as Record<Grade, bigint>,
+-      saleCount: n(p.sale_count),
+-      refundCount: n(p.refund_count),
+-    })),
+-    byGrade,
+-    gradeVolume,
+-    byDay: ((raw.byDay as Raw[]) || []).map((d) => ({
+-      day: s(d.day),
+-      saleCents: big(d.sale_amount),
+-      refundCents: big(d.refund_amount),
+-      profitCents: big(d.profit),
+-    })),
+-  };
+ }
+ 
+-function computeStatsFromOrders(rows: SalesOrder[]): Stats {
+-  const byGrade = { A: 0n, B: 0n, C: 0n, D: 0n } as Record<Grade, bigint>;
+-  const gradeVolume = { A: 0n, B: 0n, C: 0n, D: 0n } as Record<Grade, bigint>;
++function fallbackStats(rows: SalesOrder[]): Stats {
++  const byGrade = emptyGrade();
++  const gradeVolume = emptyGrade();
+   const personMap = new Map<string, PersonStat>();
+   const dayMap = new Map<string, DayStat>();
+   const saleIds = new Set<number>();
+@@ -535,56 +561,56 @@
+   let commission = 0n;
+   let saleAmount = 0n;
+   let refundAmount = 0n;
+-  for (const o of rows) {
+-    const isRefund = o.recordType === 'refund';
+-    if (isRefund) refundIds.add(o.id);
+-    else saleIds.add(o.id);
+-    let person = personMap.get(o.salespersonName);
++  for (const order of rows) {
++    const refund = order.recordType === "refund";
++    if (refund) refundIds.add(order.id);
++    else saleIds.add(order.id);
++    let person = personMap.get(order.salespersonName);
+     if (!person) {
+       person = {
+-        name: o.salespersonName,
++        name: order.salespersonName,
+         actualCents: 0n,
+         performanceCents: 0n,
+         profitCents: 0n,
+         commissionCents: 0n,
+         salePerformanceCents: 0n,
+         refundPerformanceCents: 0n,
+-        gradeActual: { A: 0n, B: 0n, C: 0n, D: 0n } as Record<Grade, bigint>,
++        gradeActual: emptyGrade(),
+         saleCount: 0,
+         refundCount: 0,
+       };
+-      personMap.set(o.salespersonName, person);
++      personMap.set(order.salespersonName, person);
+     }
+-    const dayKey = o.orderTime.slice(0, 10);
++    const dayKey = order.orderTime.slice(0, 10);
+     let day = dayMap.get(dayKey);
+     if (!day) {
+       day = { day: dayKey, saleCents: 0n, refundCents: 0n, profitCents: 0n };
+       dayMap.set(dayKey, day);
+     }
+-    for (const it of o.items) {
+-      actual += it.actualCents;
+-      performance += it.performanceCents;
+-      profit += it.profitCents;
+-      commission += it.commissionCents;
+-      byGrade[it.grade] += it.actualCents;
+-      gradeVolume[it.grade] += parseQty(it.salesTotalQuantity) ?? 0n;
+-      person.actualCents += it.actualCents;
+-      person.performanceCents += it.performanceCents;
+-      person.profitCents += it.profitCents;
+-      person.commissionCents += it.commissionCents;
+-      person.gradeActual[it.grade] += it.actualCents;
+-      if (isRefund) {
+-        person.refundPerformanceCents += it.performanceCents;
+-        refundAmount += it.actualCents;
+-        day.refundCents += it.actualCents;
++    for (const item of order.items) {
++      actual += item.actualCents;
++      performance += item.performanceCents;
++      profit += item.profitCents;
++      commission += item.commissionCents;
++      byGrade[item.grade] += item.actualCents;
++      gradeVolume[item.grade] += item.actualCents < 0n ? -item.actualCents : item.actualCents;
++      person.actualCents += item.actualCents;
++      person.performanceCents += item.performanceCents;
++      person.profitCents += item.profitCents;
++      person.commissionCents += item.commissionCents;
++      person.gradeActual[item.grade] += item.actualCents;
++      if (refund) {
++        person.refundPerformanceCents += item.performanceCents;
++        refundAmount += item.actualCents;
++        day.refundCents += item.actualCents;
+       } else {
+-        person.salePerformanceCents += it.performanceCents;
+-        saleAmount += it.actualCents;
+-        day.saleCents += it.actualCents;
++        person.salePerformanceCents += item.performanceCents;
++        saleAmount += item.actualCents;
++        day.saleCents += item.actualCents;
+       }
+-      day.profitCents += it.profitCents;
++      day.profitCents += item.profitCents;
+     }
+-    if (isRefund) person.refundCount += 1;
++    if (refund) person.refundCount += 1;
+     else person.saleCount += 1;
+   }
+   return {
+@@ -596,9 +622,9 @@
+     refundCount: refundIds.size,
+     saleAmountCents: saleAmount,
+     refundAmountCents: refundAmount,
+-    byPerson: [...personMap.values()].sort((a, b) => (a.name < b.name ? -1 : 1)),
++    byPerson: [...personMap.values()],
+     byGrade,
+     gradeVolume,
+-    byDay: [...dayMap.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),
++    byDay: [...dayMap.values()].sort((a, b) => a.day.localeCompare(b.day)),
+   };
+ }
+--- /dev/null
++++ b/src/lib/sales/wire.test.ts
+@@ -0,0 +1,128 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { formatCents } from "./money.ts";
++import { buildOrderBody, decodeFixedPoint, decodeMoneyCents, encodeRequestNumber, mapServerItem } from "./wire.ts";
++import type { OrderInput } from "./types.ts";
++
++test("request numbers stay human decimals and are never scaled", () => {
++  assert.equal(encodeRequestNumber("10"), "10");
++  assert.equal(encodeRequestNumber("6"), "6");
++  assert.equal(encodeRequestNumber("2%"), "2");
++  assert.equal(encodeRequestNumber("28.5"), "28.5");
++  assert.equal(encodeRequestNumber("619.9"), "619.9");
++  assert.equal(encodeRequestNumber("31.2500"), "31.25");
++  assert.equal(encodeRequestNumber("0.5"), "0.5");
++  assert.equal(encodeRequestNumber("1,000"), "1000");
++  assert.notEqual(encodeRequestNumber("10"), "100000");
++});
++
++test("GET fixed-point fields decode by 10000 and money by 100", () => {
++  assert.equal(decodeFixedPoint("100000"), "10");
++  assert.equal(decodeFixedPoint("60000"), "6");
++  assert.equal(decodeFixedPoint("20000"), "2");
++  assert.equal(decodeFixedPoint("285000"), "28.5");
++  assert.equal(decodeFixedPoint("6199000"), "619.9");
++  assert.equal(decodeFixedPoint("312500"), "31.25");
++  assert.equal(decodeFixedPoint("5000"), "0.5");
++  assert.equal(formatCents(decodeMoneyCents("10000")), "100.00");
++  assert.equal(formatCents(decodeMoneyCents("6000")), "60.00");
++  assert.equal(formatCents(decodeMoneyCents("4000")), "40.00");
++  assert.equal(formatCents(decodeMoneyCents("200")), "2.00");
++  assert.equal(formatCents(decodeMoneyCents("-10000")), "-100.00");
++});
++
++test("edit round-trip sends the decoded human strings, not the stored integers", () => {
++  const item = mapServerItem({
++    id: 33,
++    client_key: "ck-1",
++    product_name: "布料A",
++    unit: "米",
++    supplier_name: "甲",
++    sales_quantity_details: "[\"10\"]",
++    sales_total_quantity: "100000",
++    sales_unit_price: "100000",
++    purchase_quantity_details: "[\"10\"]",
++    purchase_total_quantity: "100000",
++    purchase_unit_price: "60000",
++    grade: "B",
++    grade_multiplier: "1.00",
++    commission_rate: "20000",
++    actual_sales_amount: "10000",
++    performance_sales_amount: "10000",
++    purchase_cost: "6000",
++    gross_profit: "4000",
++    commission_amount: "200",
++  });
++  assert.equal(item.salesUnitPrice, "10");
++  assert.equal(item.purchaseUnitPrice, "6");
++  assert.equal(item.commissionPercent, "2");
++  assert.deepEqual(item.salesQuantities, ["10"]);
++  assert.equal(item.salesTotalQuantity, "10");
++  assert.equal(item.actualSalesAmount, "100.00");
++  assert.equal(item.performanceSalesAmount, "100.00");
++  assert.equal(item.purchaseCost, "60.00");
++  assert.equal(item.grossProfit, "40.00");
++  assert.equal(item.commissionAmount, "2.00");
++
++  const input: OrderInput = {
++    recordType: "sale",
++    orderTime: "2026-09-28 10:00:00",
++    salespersonName: "张三",
++    customerName: "某客户",
++    remark: "",
++    items: [item],
++  };
++  const created = buildOrderBody(input, "create");
++  const updated = buildOrderBody(input, "update");
++  const createdJson = JSON.stringify(created);
++  const updatedJson = JSON.stringify(updated);
++  assert.match(createdJson, /"salesUnitPrice":"10"/);
++  assert.match(createdJson, /"purchaseUnitPrice":"6"/);
++  assert.match(createdJson, /"commissionPercent":"2"/);
++  assert.match(createdJson, /"salesQuantities":\["10"\]/);
++  assert.equal(createdJson.includes("100000"), false);
++  assert.equal(createdJson.includes("60000"), false);
++  assert.equal(createdJson.includes("20000"), false);
++  assert.equal(createdJson.includes("actualSalesAmount"), false);
++  assert.equal(updatedJson.includes("orderTime"), false);
++  assert.equal(updatedJson.includes("100000"), false);
++  assert.equal(Object.prototype.hasOwnProperty.call(updated, "orderTime"), false);
++});
++
++test("decimal grids survive decode without a second scale", () => {
++  const item = mapServerItem({
++    id: 1,
++    client_key: "grid",
++    product_name: "布",
++    sales_quantity_details: "[\"619.9\",\"31.25\",\"0.5\"]",
++    sales_total_quantity: "6516500",
++    sales_unit_price: "100000",
++    purchase_quantity_details: "[\"10\"]",
++    purchase_total_quantity: "100000",
++    purchase_unit_price: "60000",
++    grade: "A",
++    commission_rate: "20000",
++    actual_sales_amount: "0",
++    performance_sales_amount: "0",
++    purchase_cost: "0",
++    gross_profit: "0",
++    commission_amount: "0",
++  });
++  assert.deepEqual(item.salesQuantities, ["619.9", "31.25", "0.5"]);
++  assert.equal(item.salesTotalQuantity, "651.65");
++  assert.equal(item.commissionPercent, "2");
++  const body = buildOrderBody({
++    recordType: "sale",
++    orderTime: "2026-09-28 10:00:00",
++    salespersonName: "张三",
++    customerName: "客户",
++    remark: "",
++    items: [item],
++  }, "update");
++  const json = JSON.stringify(body);
++  assert.match(json, /"619.9"/);
++  assert.match(json, /"31.25"/);
++  assert.match(json, /"0.5"/);
++  assert.equal(json.includes("6516500"), false);
++  assert.equal(json.includes("6199000"), false);
++});
+--- /dev/null
++++ b/src/lib/sales/wire.ts
+@@ -0,0 +1,195 @@
++import type { AttachmentType, Grade, OrderInput, OrderItem, SalesOrder } from "./types.ts";
++import { formatCents, formatQty } from "./money.ts";
++
++/** POST/PUT numbers are the text the user typed. Never multiply by 10000. */
++export function encodeRequestNumber(input: string): string {
++  const cleaned = input.trim().replace(/,/g, "").replace(/，/g, "").replace(/%/g, "").replace(/％/g, "").trim();
++  if (!/^\d+(\.\d{1,4})?$/.test(cleaned)) throw new Error("订单数据不完整，请检查后再提交");
++  const [whole, frac = ""] = cleaned.split(".");
++  const trimmedFrac = frac.replace(/0+$/, "");
++  const body = trimmedFrac ? `${whole.replace(/^0+(?=\d)/, "") || "0"}.${trimmedFrac}` : whole.replace(/^0+(?=\d)/, "") || "0";
++  return body;
++}
++
++/** GET quantity, unit price, and commission rate are fixed-point integers (×10000). */
++export function decodeFixedPoint(raw: unknown): string {
++  const text = String(raw ?? "").trim();
++  if (!text) return "0";
++  if (/^-?\d+$/.test(text)) return formatQty(BigInt(text));
++  if (/^-?\d+\.\d+$/.test(text)) {
++    const negative = text.startsWith("-");
++    const body = negative ? text.slice(1) : text;
++    try {
++      const human = encodeRequestNumber(body);
++      return negative && human !== "0" ? `-${human}` : human;
++    } catch {
++      return "0";
++    }
++  }
++  return "0";
++}
++
++export function decodeMoneyCents(raw: unknown): bigint {
++  const text = String(raw ?? "0").trim();
++  if (!/^-?\d+$/.test(text)) return 0n;
++  return BigInt(text);
++}
++
++function field(row: Record<string, unknown>, snake: string, camel: string): unknown {
++  if (Object.prototype.hasOwnProperty.call(row, snake) && row[snake] != null) return row[snake];
++  if (Object.prototype.hasOwnProperty.call(row, camel) && row[camel] != null) return row[camel];
++  return "";
++}
++
++function text(value: unknown): string {
++  return value == null ? "" : String(value);
++}
++
++function parseDetails(value: unknown): string[] {
++  if (Array.isArray(value)) return value.map((item) => String(item));
++  const raw = text(value).trim();
++  if (!raw) return [];
++  try {
++    const parsed = JSON.parse(raw);
++    return Array.isArray(parsed) ? parsed.map((item) => String(item)) : [];
++  } catch {
++    return [];
++  }
++}
++
++export function mapServerItem(row: Record<string, unknown>): OrderItem {
++  const actual = decodeMoneyCents(field(row, "actual_sales_amount", "actualSalesAmount"));
++  const performance = decodeMoneyCents(field(row, "performance_sales_amount", "performanceSalesAmount"));
++  const cost = decodeMoneyCents(field(row, "purchase_cost", "purchaseCost"));
++  const profit = decodeMoneyCents(field(row, "gross_profit", "grossProfit"));
++  const commission = decodeMoneyCents(field(row, "commission_amount", "commissionAmount"));
++  const grade = text(field(row, "grade", "grade")) as Grade;
++  return {
++    id: Number(field(row, "id", "id") || 0),
++    clientKey: text(field(row, "client_key", "clientKey")),
++    productCode: text(field(row, "product_code", "productCode")),
++    productName: text(field(row, "product_name", "productName")),
++    customerProductCode: text(field(row, "customer_product_code", "customerProductCode")),
++    supplierProductCode: text(field(row, "supplier_product_code", "supplierProductCode")),
++    specification: text(field(row, "specification", "specification")),
++    fabricWidth: text(field(row, "fabric_width", "fabricWidth")),
++    fabricWeight: text(field(row, "fabric_weight", "fabricWeight")),
++    unit: text(field(row, "unit", "unit")),
++    color: text(field(row, "color", "color")),
++    supplierName: text(field(row, "supplier_name", "supplierName")),
++    salesPackageCount: Number(field(row, "sales_package_count", "salesPackageCount") || 0),
++    salesQuantities: parseDetails(field(row, "sales_quantity_details", "salesQuantities")),
++    salesTotalQuantity: decodeFixedPoint(field(row, "sales_total_quantity", "salesTotalQuantity")),
++    salesUnitPrice: decodeFixedPoint(field(row, "sales_unit_price", "salesUnitPrice")),
++    purchasePackageCount: Number(field(row, "purchase_package_count", "purchasePackageCount") || 0),
++    purchaseQuantities: parseDetails(field(row, "purchase_quantity_details", "purchaseQuantities")),
++    purchaseTotalQuantity: decodeFixedPoint(field(row, "purchase_total_quantity", "purchaseTotalQuantity")),
++    purchaseUnitPrice: decodeFixedPoint(field(row, "purchase_unit_price", "purchaseUnitPrice")),
++    grade: grade === "A" || grade === "B" || grade === "C" || grade === "D" ? grade : "B",
++    gradeMultiplier: text(field(row, "grade_multiplier", "gradeMultiplier")),
++    commissionPercent: decodeFixedPoint(field(row, "commission_rate", "commissionPercent")),
++    actualSalesAmount: formatCents(actual),
++    performanceSalesAmount: formatCents(performance),
++    purchaseCost: formatCents(cost),
++    grossProfit: formatCents(profit),
++    commissionAmount: formatCents(commission),
++    actualCents: actual,
++    performanceCents: performance,
++    costCents: cost,
++    profitCents: profit,
++    commissionCents: commission,
++  };
++}
++
++export function displayOrderTime(value: string): string {
++  if (!value.includes("T")) return value;
++  const date = new Date(value);
++  if (Number.isNaN(date.getTime())) return value;
++  const pad = (n: number) => String(n).padStart(2, "0");
++  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
++}
++
++export function toIsoOrderTime(value: string): string {
++  const match = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})$/.exec(value.trim());
++  if (!match) return value;
++  const date = new Date(`${match[1]}T${match[2]}`);
++  if (Number.isNaN(date.getTime())) return value;
++  return date.toISOString();
++}
++
++function encodeItem(item: OrderInput["items"][number]) {
++  return {
++    clientKey: item.clientKey,
++    productCode: item.productCode,
++    productName: item.productName,
++    customerProductCode: item.customerProductCode,
++    supplierProductCode: item.supplierProductCode,
++    specification: item.specification,
++    fabricWidth: item.fabricWidth,
++    fabricWeight: item.fabricWeight,
++    unit: item.unit,
++    color: item.color,
++    supplierName: item.supplierName,
++    salesQuantities: item.salesQuantities.map((value) => encodeRequestNumber(value)),
++    salesUnitPrice: encodeRequestNumber(item.salesUnitPrice),
++    purchaseQuantities: item.purchaseQuantities.map((value) => encodeRequestNumber(value)),
++    purchaseUnitPrice: encodeRequestNumber(item.purchaseUnitPrice),
++    grade: item.grade,
++    commissionPercent: encodeRequestNumber(item.commissionPercent),
++  };
++}
++
++/** Create sends orderTime. Update must not. Neither sends calculated money. */
++export function buildOrderBody(input: OrderInput, mode: "create" | "update"): Record<string, unknown> {
++  const body: Record<string, unknown> = {
++    recordType: input.recordType,
++    salespersonName: input.salespersonName,
++    customerName: input.customerName,
++    remark: input.remark ?? "",
++    items: input.items.map(encodeItem),
++  };
++  if (mode === "create") body.orderTime = toIsoOrderTime(input.orderTime);
++  return body;
++}
++
++export function sumItemCents(items: OrderItem[]) {
++  return items.reduce(
++    (sum, item) => ({
++      actualCents: sum.actualCents + item.actualCents,
++      performanceCents: sum.performanceCents + item.performanceCents,
++      costCents: sum.costCents + item.costCents,
++      profitCents: sum.profitCents + item.profitCents,
++      commissionCents: sum.commissionCents + item.commissionCents,
++    }),
++    { actualCents: 0n, performanceCents: 0n, costCents: 0n, profitCents: 0n, commissionCents: 0n },
++  );
++}
++
++export function mapServerOrder(order: Record<string, unknown>, items: OrderItem[], attachmentCount: number): SalesOrder {
++  return {
++    id: Number(field(order, "id", "id") || 0),
++    recordType: text(field(order, "record_type", "recordType")) === "refund" ? "refund" : "sale",
++    orderTime: displayOrderTime(text(field(order, "order_time", "orderTime"))),
++    salespersonName: text(field(order, "salesperson_name", "salespersonName")),
++    customerName: text(field(order, "customer_name", "customerName")),
++    remark: text(field(order, "remark", "remark")),
++    items,
++    itemCount: items.length,
++    ...sumItemCents(items),
++    createdByUserId: field(order, "created_by_user_id", "createdByUserId") == null || field(order, "created_by_user_id", "createdByUserId") === ""
++      ? null
++      : Number(field(order, "created_by_user_id", "createdByUserId")),
++    createdByName: text(field(order, "created_by_name", "createdByName")),
++    createdAt: displayOrderTime(text(field(order, "created_at", "createdAt"))),
++    updatedByUserId: field(order, "updated_by_user_id", "updatedByUserId") == null || field(order, "updated_by_user_id", "updatedByUserId") === ""
++      ? null
++      : Number(field(order, "updated_by_user_id", "updatedByUserId")),
++    updatedByName: text(field(order, "updated_by_name", "updatedByName")),
++    updatedAt: displayOrderTime(text(field(order, "updated_at", "updatedAt"))),
++    attachmentCount,
++  };
++}
++
++export function isAttachmentType(value: string): value is AttachmentType {
++  return value === "sales_document" || value === "purchase_document" || value === "payment_receipt";
++}
+--- a/运行说明.txt
++++ b/运行说明.txt
+@@ -1,17 +1,18 @@
+ 销售业绩统计系统 — 运行说明
+ 
+-这是 Windows 桌面程序。双击「销售业绩统计系统.exe」即可使用。
+-不需要浏览器，不需要 Node，不需要 npm，不需要服务器，也不需要联网。
++这是 Windows 桌面程序。双击「销售业绩统计系统-联网版-RC.exe」即可使用。
++不需要浏览器，不需要 Node，不需要 npm。业务数据在服务器上，不在本机账本里。
+ 
+ 一、Windows 上直接使用
+-1. 解压「销售业绩统计系统-windows-x64-v2.zip」。
+-2. 进入解压后的文件夹，双击「销售业绩统计系统.exe」。
+-3. 第一次打开先创建主账户。主账户不能被其他账户删除、停用、改密码或降权。
+-4. 关闭窗口后，再次双击同一 EXE，登录即可看到原来的单据。
++1. 先在本机建立 SSH 隧道，使 http://127.0.0.1:3200 指向销售接口。正式 HTTPS 就绪后，只改接口地址，不改业务。
++2. 解压 Windows Release ZIP，进入 win-unpacked，双击「销售业绩统计系统-联网版-RC.exe」。
++3. 使用服务器账号登录。不同电脑登录同一服务器，看到的是同一份订单、统计和附件。
++4. 开发默认接口：http://127.0.0.1:3200
++   正式接口：https://sales-api.hqyk.pro
++   可用环境变量 SALES_API_BASE_URL，或在用户数据目录写入一行 api-base-url.txt。
++   不要填写数据库地址，不要填写 106.53.96.62。
+ 
+-账本文件不在安装目录里，而在当前 Windows 用户的数据目录：
+-%APPDATA%\销售业绩统计系统\data\sales-performance.db
+-也就是 C:\Users\你的用户名\AppData\Roaming\销售业绩统计系统\data\sales-performance.db
++客户端不保存正式订单。登录令牌只放在本机加密会话里，不会写进源码。
+ 
+ 二、从源码检查或重新打包
+ 需要 Node.js 22。
+@@ -19,14 +20,9 @@
+ 2. 执行：npm test
+ 3. 执行：npm run typecheck
+ 4. 在本机生成 Windows x64 目录：npm run desktop:pack
+-   产物在 release/win-unpacked/，其中有 销售业绩统计系统.exe
++   产物在 release/win-unpacked/
+ 
+-业务界面、多商品、数量格、ABCD、提成、毛利、账户和销售员/客户联动都沿用现有实现。
+-桌面版把 SQLite 写成本地文件，不再使用浏览器 IndexedDB。
+-每个商品另外有本商品小计、幅宽、克重、单位（项 / KG / 米 / 码，只标识不换算）和商品名称历史补全。
+-逐格数量的序号是灰色小标签，数量本身用更大的粗体数字。
+-图片附件保存在同一用户数据目录的 attachments 文件夹，是软件自己的副本。
+-删除桌面上的原始图片，不会影响系统里已经上传的单据、供应商单据和收款凭证。
+-附件不参与金额、业绩、毛利或提成计算。
+-
+-旧账本打开时会自动补上新字段，原来的单据仍然可以读取。
++界面、多商品、数量格、ABCD、退货、销售员/客户联动、账户和附件入口都沿用现有实现。
++提交订单时发送用户输入的十进制字符串（例如数量 10、单价 10、提成 2），不要自行乘 10000。
++服务器返回的数量和单价按 10000 还原，金额按分还原后再显示。
++最终金额以服务器计算结果为准。
